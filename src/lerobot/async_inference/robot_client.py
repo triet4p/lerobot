@@ -378,8 +378,13 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
+        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+
+        self.logger.info(f"[EXECUTE] Action #{timed_action.get_timestep()} | "
+                     f"Values: {action_dict}")
+
         _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
+            action_dict
         )
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
@@ -388,13 +393,13 @@ class RobotClient:
             with self.action_queue_lock:
                 current_queue_size = self.action_queue.qsize()
 
-            self.logger.debug(
+            self.logger.info(
                 f"Ts={timed_action.get_timestamp()} | "
                 f"Action #{timed_action.get_timestep()} performed | "
                 f"Queue size: {current_queue_size}"
             )
 
-            self.logger.debug(
+            self.logger.info(
                 f"Popping action from queue to perform took {get_end:.6f}s | Queue size: {current_queue_size}"
             )
 
