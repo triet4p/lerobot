@@ -25,6 +25,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import XVLAAdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 # Conditional import for type checking and lazy loading
@@ -82,6 +83,7 @@ class XVLAConfig(PreTrainedConfig):
     # Action & proprioception
     action_mode: str = "ee6d"
     num_denoising_steps: int = 10
+    rtc_config: RTCConfig | None = None
     use_proprio: bool = True
     max_state_dim: int = 32
     max_action_dim: int = 20  # Maximum action dimension for padding (used by "auto" action mode)

@@ -15,7 +15,7 @@
 """
 Example command:
 ```shell
-python src/lerobot/async_inference/robot_client.py \
+python -m lerobot.rtc_inference.robot_client \
     --robot.type=so100_follower \
     --robot.port=/dev/tty.usbmodem58760431541 \
     --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 1920, height: 1080, fps: 30}}" \
@@ -106,6 +106,14 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            rtc_enabled=config.rtc_enabled,
+            rtc_execution_horizon=config.rtc_execution_horizon,
+            rtc_max_guidance_weight=config.rtc_max_guidance_weight,
+            rtc_prefix_attention_schedule=config.rtc_prefix_attention_schedule,
+            rtc_debug=config.rtc_debug,
+            rtc_debug_maxlen=config.rtc_debug_maxlen,
+            inference_delay_steps=config.inference_delay_steps,
+            xvla_domain_id=config.xvla_domain_id,
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -125,6 +133,7 @@ class RobotClient:
         self.action_queue = Queue()
         self.action_queue_lock = threading.Lock()  # Protect queue operations
         self.action_queue_size = []
+        self._saved_debug_frames = False
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
 
         # FPS measurement
@@ -234,7 +243,8 @@ class RobotClient:
 
         future_action_queue = Queue()
         with self.action_queue_lock:
-            internal_queue = self.action_queue.queue
+            # Copy current queue content under lock to avoid concurrent mutation while iterating.
+            internal_queue = list(self.action_queue.queue)
 
         current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
 
@@ -378,35 +388,26 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
-        # Đây là Pose mà AI muốn (Target)
         action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
 
-        # --- CÁCH LẤY VỊ TRÍ THỰC TẾ (STATE) ĐỂ DEBUG ---
-        # 1. Gọi hàm get_observation theo đúng class Robot
-        current_obs = self.robot.get_observation()
-        
-        # 2. LeRobot lưu vị trí các khớp trong key 'observation.state' (kiểu tensor/array)
-        # Chúng ta cần map lại vì action_dict dùng tên khớp, còn observation.state thường là mảng số
-        current_positions = current_obs.get("observation.state", None)
-        
-        if current_positions is not None:
-            # Chuyển đổi tensor/numpy sang list để dễ nhìn
-            if hasattr(current_positions, "tolist"):
-                curr_list = current_positions.tolist()
-            else:
-                curr_list = list(current_positions)
-            
-            # Lấy list các giá trị action AI yêu cầu theo đúng thứ tự khớp
-            target_list = [action_dict[k] for k in self.robot.action_features]
+        # Optional verbose diagnostics: compare target action vs current joint state.
+        if verbose:
+            current_obs = self.robot.get_observation()
+            current_positions = current_obs.get("observation.state", None)
 
-            # Tính Delta (Action so với Current Pose)
-            deltas = [t - c for t, c in zip(target_list, curr_list)]
-            
-            self.logger.info(f"[DEBUG] Timestep #{timed_action.get_timestep()}")
-            self.logger.info(f"AI Target (Rel to Zero): {target_list}")
-            self.logger.info(f"Actual Pos (Rel to Zero): {curr_list}")
-            self.logger.info(f"Delta (Robot needs to move): {deltas}")
-        # -----------------------------------------------
+            if current_positions is not None:
+                if hasattr(current_positions, "tolist"):
+                    curr_list = current_positions.tolist()
+                else:
+                    curr_list = list(current_positions)
+
+                target_list = [action_dict[k] for k in self.robot.action_features]
+                deltas = [t - c for t, c in zip(target_list, curr_list)]
+
+                self.logger.info(f"[DEBUG] Timestep #{timed_action.get_timestep()}")
+                self.logger.info(f"AI Target (Rel to Zero): {target_list}")
+                self.logger.info(f"Actual Pos (Rel to Zero): {curr_list}")
+                self.logger.info(f"Delta (Robot needs to move): {deltas}")
 
         _performed_action = self.robot.send_action(
             action_dict
@@ -442,24 +443,41 @@ class RobotClient:
 
             raw_observation: RawObservation = self.robot.get_observation()
             raw_observation["task"] = task
-            
-            import cv2
-            import os
-            import numpy as np
-            os.makedirs("debug_frames", exist_ok=True)
-            for key, value in raw_observation.items():
-                if "image" in key or "camera" in key:
-                    if hasattr(value, 'numpy'):
-                        frame = value.numpy()
-                    elif isinstance(value, np.ndarray):
-                        frame = value
-                    else:
-                        continue
-                    # Chỉ save 1 frame duy nhất để check
-                    save_path = f"debug_frames/{key}.png"
-                    if not os.path.exists(save_path):
-                        cv2.imwrite(save_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                        self.logger.info(f"[DEBUG] Saved frame: {save_path} | shape: {frame.shape}")
+
+            # Save one debug frame per camera only in verbose mode.
+            if verbose and not self._saved_debug_frames:
+                try:
+                    import cv2
+                    import numpy as np
+                    from pathlib import Path
+
+                    debug_dir = Path("debug_frames")
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+
+                    saved_any = False
+                    for key, value in raw_observation.items():
+                        if "image" not in key and "camera" not in key:
+                            continue
+
+                        if hasattr(value, "numpy"):
+                            frame = value.numpy()
+                        elif isinstance(value, np.ndarray):
+                            frame = value
+                        else:
+                            continue
+
+                        save_path = debug_dir / f"{key}.png"
+                        if not save_path.exists():
+                            cv2.imwrite(str(save_path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                            self.logger.info(
+                                f"[DEBUG] Saved frame: {save_path.as_posix()} | shape: {frame.shape}"
+                            )
+                            saved_any = True
+
+                    if saved_any:
+                        self._saved_debug_frames = True
+                except Exception as debug_err:
+                    self.logger.debug(f"Skip debug frame dump: {debug_err}")
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
