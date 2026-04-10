@@ -363,6 +363,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
             return False
 
+        # In RTC mode, aggressively accept observations to avoid queue starvation between chunks.
+        # Delay compensation and action queue merging already stabilize continuity.
+        if self.rtc_enabled:
+            return True
+
         elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features):
             self.logger.debug(
                 f"Skipping observation #{obs.get_timestep()} - Observation too similar to last obs predicted!"
