@@ -170,6 +170,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         start = time.perf_counter()
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
 
+        policy_n_action_steps = getattr(self.policy.config, "n_action_steps", None)
+        policy_chunk_size = getattr(self.policy.config, "chunk_size", None)
+        self.logger.info(
+            "Policy action horizon | n_action_steps=%s | chunk_size=%s | requested_actions_per_chunk=%s",
+            policy_n_action_steps,
+            policy_chunk_size,
+            self.actions_per_chunk,
+        )
+        if policy_n_action_steps is not None and self.actions_per_chunk > policy_n_action_steps:
+            self.logger.warning(
+                "actions_per_chunk=%s exceeds model n_action_steps=%s; output will be capped by model horizon.",
+                self.actions_per_chunk,
+                policy_n_action_steps,
+            )
+
         if getattr(policy_specs, "xvla_domain_id", None) is not None and hasattr(self.policy.config, "domain_id"):
             self.policy.config.domain_id = policy_specs.xvla_domain_id
 
@@ -423,6 +438,18 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return max(0, math.ceil(self.rtc_latency_tracker.max() / self.config.environment_dt))
 
+    def _rtc_advance_steps(self, steps: int) -> None:
+        """Advance RTC queue index by a fixed number of consumed steps."""
+        if not self.rtc_enabled or self.rtc_action_queue is None or steps <= 0:
+            return
+
+        with self.rtc_action_queue.lock:
+            if self.rtc_action_queue.queue is not None:
+                self.rtc_action_queue.last_index = min(
+                    len(self.rtc_action_queue.queue),
+                    self.rtc_action_queue.last_index + steps,
+                )
+
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
         if not self.rtc_enabled or self.rtc_action_queue is None:
@@ -502,6 +529,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         if self.rtc_enabled and self.rtc_action_queue is not None:
             real_delay = max(0, math.ceil(inference_time / self.config.environment_dt))
+            self._rtc_advance_steps(real_delay)
             self.rtc_action_queue.merge(
                 original_actions=raw_action_tensor.squeeze(0).detach().cpu(),
                 processed_actions=processed_action_tensor,
