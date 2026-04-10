@@ -59,6 +59,7 @@ class RTCXVLAClientOnlyConfig:
 
     # Client loop/runtime parameters
     fps: int = 30
+    interpolation_multiplier: int = 1
     debug_visualize_queue_size: bool = False
 
     def __post_init__(self):
@@ -80,6 +81,8 @@ class RTCXVLAClientOnlyConfig:
             )
         if self.fps <= 0:
             raise ValueError("fps must be > 0")
+        if self.interpolation_multiplier <= 0:
+            raise ValueError("interpolation_multiplier must be > 0")
         if self.inference_delay_steps is not None and self.inference_delay_steps < 0:
             raise ValueError("inference_delay_steps must be >= 0")
 
@@ -97,6 +100,7 @@ def _to_robot_client_config(cfg: RTCXVLAClientOnlyConfig) -> RobotClientConfig:
         client_device=cfg.client_device,
         chunk_size_threshold=cfg.chunk_size_threshold,
         fps=cfg.fps,
+        interpolation_multiplier=cfg.interpolation_multiplier,
         aggregate_fn_name=cfg.aggregate_fn_name,
         debug_visualize_queue_size=cfg.debug_visualize_queue_size,
         rtc_enabled=True,

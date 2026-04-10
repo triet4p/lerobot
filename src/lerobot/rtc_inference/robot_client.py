@@ -49,6 +49,7 @@ import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.policies.rtc import ActionInterpolator
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -130,6 +131,8 @@ class RobotClient:
         self.action_chunk_size = -1
 
         self._chunk_size_threshold = config.chunk_size_threshold
+        self.interpolator = ActionInterpolator(config.interpolation_multiplier)
+        self.control_interval = self.interpolator.get_control_interval(self.config.fps)
 
         self.action_queue = Queue()
         self.action_queue_lock = threading.Lock()  # Protect queue operations
@@ -372,24 +375,34 @@ class RobotClient:
     def actions_available(self):
         """Check if there are actions available in the queue"""
         with self.action_queue_lock:
-            return not self.action_queue.empty()
+            queue_has_actions = not self.action_queue.empty()
+        return queue_has_actions or (not self.interpolator.needs_new_action())
 
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
 
-    def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
+    def control_loop_action(self, verbose: bool = False) -> dict[str, Any] | None:
         """Reading and performing actions in local queue"""
 
-        # Lock only for queue operations
+        timed_action = None
         get_start = time.perf_counter()
         with self.action_queue_lock:
             self.action_queue_size.append(self.action_queue.qsize())
-            # Get action from queue
-            timed_action = self.action_queue.get_nowait()
+            if self.interpolator.needs_new_action() and not self.action_queue.empty():
+                timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
-        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        if timed_action is not None:
+            self.interpolator.add(timed_action.get_action())
+            with self.latest_action_lock:
+                self.latest_action = timed_action.get_timestep()
+
+        action_tensor = self.interpolator.get()
+        if action_tensor is None:
+            return None
+
+        action_dict = self._action_tensor_to_action_dict(action_tensor)
 
         # Optional verbose diagnostics: compare target action vs current joint state.
         if verbose:
@@ -405,24 +418,23 @@ class RobotClient:
                 target_list = [action_dict[k] for k in self.robot.action_features]
                 deltas = [t - c for t, c in zip(target_list, curr_list)]
 
-                self.logger.info(f"[DEBUG] Timestep #{timed_action.get_timestep()}")
+                current_ts = timed_action.get_timestep() if timed_action is not None else self.latest_action
+                self.logger.info(f"[DEBUG] Timestep #{current_ts}")
                 self.logger.info(f"AI Target (Rel to Zero): {target_list}")
                 self.logger.info(f"Actual Pos (Rel to Zero): {curr_list}")
                 self.logger.info(f"Delta (Robot needs to move): {deltas}")
 
-        _performed_action = self.robot.send_action(
-            action_dict
-        )
-        with self.latest_action_lock:
-            self.latest_action = timed_action.get_timestep()
+        _performed_action = self.robot.send_action(action_dict)
 
         if verbose:
             with self.action_queue_lock:
                 current_queue_size = self.action_queue.qsize()
 
+            current_ts = timed_action.get_timestep() if timed_action is not None else self.latest_action
+
             self.logger.info(
-                f"Ts={timed_action.get_timestamp()} | "
-                f"Action #{timed_action.get_timestep()} performed | "
+                f"Ts={time.time()} | "
+                f"Action #{current_ts} performed | "
                 f"Queue size: {current_queue_size}"
             )
 
@@ -543,7 +555,7 @@ class RobotClient:
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
-            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+            time.sleep(max(0, self.control_interval - (time.perf_counter() - control_loop_start)))
 
         return _captured_observation, _performed_action
 
