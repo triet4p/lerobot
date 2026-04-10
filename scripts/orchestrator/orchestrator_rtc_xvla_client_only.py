@@ -59,6 +59,9 @@ class RTCXVLAClientOnlyConfig:
 
     # Client loop/runtime parameters
     fps: int = 30
+    obs_timestep_independent: bool = True
+    image_compress_enable: bool = False
+    image_compress_quality: int = 90
     interpolation_multiplier: int = 1
     debug_visualize_queue_size: bool = False
 
@@ -81,6 +84,12 @@ class RTCXVLAClientOnlyConfig:
             )
         if self.fps <= 0:
             raise ValueError("fps must be > 0")
+        if not isinstance(self.obs_timestep_independent, bool):
+            raise ValueError("obs_timestep_independent must be a boolean")
+        if not isinstance(self.image_compress_enable, bool):
+            raise ValueError("image_compress_enable must be a boolean")
+        if not (1 <= self.image_compress_quality <= 100):
+            raise ValueError("image_compress_quality must be in [1, 100]")
         if self.interpolation_multiplier <= 0:
             raise ValueError("interpolation_multiplier must be > 0")
         if self.inference_delay_steps is not None and self.inference_delay_steps < 0:
@@ -100,6 +109,9 @@ def _to_robot_client_config(cfg: RTCXVLAClientOnlyConfig) -> RobotClientConfig:
         client_device=cfg.client_device,
         chunk_size_threshold=cfg.chunk_size_threshold,
         fps=cfg.fps,
+        obs_timestep_independent=cfg.obs_timestep_independent,
+        image_compress_enable=cfg.image_compress_enable,
+        image_compress_quality=cfg.image_compress_quality,
         interpolation_multiplier=cfg.interpolation_multiplier,
         aggregate_fn_name=cfg.aggregate_fn_name,
         debug_visualize_queue_size=cfg.debug_visualize_queue_size,

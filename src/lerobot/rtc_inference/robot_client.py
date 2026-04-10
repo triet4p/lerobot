@@ -75,6 +75,7 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    encode_observation_images_for_transport,
     get_logger,
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
@@ -116,6 +117,8 @@ class RobotClient:
             rtc_debug_maxlen=config.rtc_debug_maxlen,
             inference_delay_steps=config.inference_delay_steps,
             xvla_domain_id=config.xvla_domain_id,
+            image_compress_enable=config.image_compress_enable,
+            image_compress_quality=config.image_compress_quality,
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -131,6 +134,9 @@ class RobotClient:
         self.action_chunk_size = -1
 
         self._chunk_size_threshold = config.chunk_size_threshold
+        self.obs_timestep_independent = config.obs_timestep_independent
+        self._obs_timestep_lock = threading.Lock()
+        self._next_obs_timestep = 0
         self.interpolator = ActionInterpolator(config.interpolation_multiplier)
         self.control_interval = self.interpolator.get_control_interval(self.config.fps)
 
@@ -139,11 +145,21 @@ class RobotClient:
         self.action_queue_size = []
         self._saved_debug_frames = False
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
+        self._transport_mode_logged = False
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
 
         self.logger.info("Robot connected and ready")
+        self.logger.info(
+            "Observation timestep mode: %s",
+            "independent-monotonic" if self.obs_timestep_independent else "action-linked",
+        )
+        self.logger.info(
+            "Observation transport mode: %s | jpeg_quality=%s",
+            "jpeg" if self.config.image_compress_enable else "raw",
+            self.config.image_compress_quality,
+        )
 
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
@@ -449,6 +465,16 @@ class RobotClient:
         with self.action_queue_lock:
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
+    def _get_observation_timestep(self) -> int:
+        if self.obs_timestep_independent:
+            with self._obs_timestep_lock:
+                timestep = self._next_obs_timestep
+                self._next_obs_timestep += 1
+            return timestep
+
+        with self.latest_action_lock:
+            return max(self.latest_action, 0)
+
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
@@ -456,6 +482,12 @@ class RobotClient:
 
             raw_observation: RawObservation = self.robot.get_observation()
             raw_observation["task"] = task
+
+            transport_observation, transport_stats = encode_observation_images_for_transport(
+                raw_observation,
+                enabled=self.config.image_compress_enable,
+                quality=self.config.image_compress_quality,
+            )
 
             # Save one debug frame per camera only in verbose mode.
             if verbose and not self._saved_debug_frames:
@@ -492,13 +524,10 @@ class RobotClient:
                 except Exception as debug_err:
                     self.logger.debug(f"Skip debug frame dump: {debug_err}")
 
-            with self.latest_action_lock:
-                latest_action = self.latest_action
-
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
-                observation=raw_observation,
-                timestep=max(latest_action, 0),
+                observation=transport_observation,
+                timestep=self._get_observation_timestep(),
             )
 
             obs_capture_time = time.perf_counter() - start_time
@@ -509,6 +538,22 @@ class RobotClient:
                 current_queue_size = self.action_queue.qsize()
 
             _ = self.send_observation(observation)
+
+            if not self._transport_mode_logged:
+                raw_total = int(transport_stats.get("raw_total_bytes", 0))
+                enc_total = int(transport_stats.get("encoded_total_bytes", 0))
+                ratio = (enc_total / raw_total) if raw_total > 0 else float("nan")
+                self.logger.info(
+                    "Transport session settings | mode=%s | jpeg_quality=%s | "
+                    "encoded_images=%s | raw_total_bytes=%s | encoded_total_bytes=%s | ratio=%.4f",
+                    transport_stats.get("mode", "raw"),
+                    self.config.image_compress_quality,
+                    transport_stats.get("encoded_image_count", 0),
+                    raw_total,
+                    enc_total,
+                    ratio,
+                )
+                self._transport_mode_logged = True
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
             if observation.must_go:

@@ -178,6 +178,18 @@ class RobotClientConfig:
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+    obs_timestep_independent: bool = field(
+        default=True,
+        metadata={"help": "Use a monotonic observation timestep independent from action timestep"},
+    )
+    image_compress_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable JPEG compression for transport only (no resize)"},
+    )
+    image_compress_quality: int = field(
+        default=90,
+        metadata={"help": "JPEG quality for transport compression (1-100)"},
+    )
     interpolation_multiplier: int = field(
         default=1,
         metadata={"help": "Control-rate multiplier for action interpolation (1 = disabled)"},
@@ -222,6 +234,17 @@ class RobotClientConfig:
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
 
+        if not isinstance(self.obs_timestep_independent, bool):
+            raise ValueError("obs_timestep_independent must be a boolean")
+
+        if not isinstance(self.image_compress_enable, bool):
+            raise ValueError("image_compress_enable must be a boolean")
+
+        if not 1 <= self.image_compress_quality <= 100:
+            raise ValueError(
+                f"image_compress_quality must be between 1 and 100, got {self.image_compress_quality}"
+            )
+
         if self.interpolation_multiplier <= 0:
             raise ValueError(
                 f"interpolation_multiplier must be positive, got {self.interpolation_multiplier}"
@@ -264,6 +287,9 @@ class RobotClientConfig:
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
+            "obs_timestep_independent": self.obs_timestep_independent,
+            "image_compress_enable": self.image_compress_enable,
+            "image_compress_quality": self.image_compress_quality,
             "interpolation_multiplier": self.interpolation_multiplier,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
