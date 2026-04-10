@@ -178,3 +178,5 @@ outputs/
 *.part
 
 models/*
+
+client.txt

@@ -34,6 +34,14 @@ class RTCXVLAClientOnlyConfig:
     pretrained_name_or_path: str = ""
     policy_device: str = "cuda"
     client_device: str = "cpu"
+    rename_map: dict[str, str] = field(
+        default_factory=lambda: {
+            "observation.images.camera1": "observation.images.image",
+            "observation.images.camera2": "observation.images.image2",
+            "observation.images.camera3": "observation.images.image3",
+            "observation.images.camera4": "observation.images.image4",
+        }
+    )
 
     # Chunking and aggregation behavior
     actions_per_chunk: int = 50
@@ -60,6 +68,8 @@ class RTCXVLAClientOnlyConfig:
             raise ValueError("policy_type must be 'xvla' for RTC XVLA orchestrator")
         if not self.pretrained_name_or_path:
             raise ValueError("pretrained_name_or_path is required")
+        if not isinstance(self.rename_map, dict):
+            raise ValueError("rename_map must be a dictionary")
         if self.actions_per_chunk <= 0:
             raise ValueError("actions_per_chunk must be > 0")
         if not (0 <= self.chunk_size_threshold <= 1):
@@ -81,6 +91,7 @@ def _to_robot_client_config(cfg: RTCXVLAClientOnlyConfig) -> RobotClientConfig:
         robot=cfg.robot,
         actions_per_chunk=cfg.actions_per_chunk,
         task=cfg.task,
+        rename_map=cfg.rename_map,
         server_address=cfg.server_address,
         policy_device=cfg.policy_device,
         client_device=cfg.client_device,
