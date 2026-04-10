@@ -125,7 +125,9 @@ def prepare_image(image: torch.Tensor) -> torch.Tensor:
 
 
 def _is_transport_image_key(key: str, value: Any) -> bool:
-    if not key.startswith(OBS_IMAGES):
+    key_lower = key.lower()
+    looks_like_image_key = key.startswith(OBS_IMAGES) or ("camera" in key_lower) or ("image" in key_lower)
+    if not looks_like_image_key:
         return False
     if isinstance(value, torch.Tensor):
         return value.ndim == 3

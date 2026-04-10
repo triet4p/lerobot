@@ -137,6 +137,8 @@ class RobotClient:
         self.obs_timestep_independent = config.obs_timestep_independent
         self._obs_timestep_lock = threading.Lock()
         self._next_obs_timestep = 0
+        self._obs_send_interval = 1.0 / float(self.config.fps)
+        self._last_obs_send_perf: float | None = None
         self.interpolator = ActionInterpolator(config.interpolation_multiplier)
         self.control_interval = self.interpolator.get_control_interval(self.config.fps)
 
@@ -462,7 +464,14 @@ class RobotClient:
 
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
+        now = time.perf_counter()
+        if self._last_obs_send_perf is not None and (now - self._last_obs_send_perf) < self._obs_send_interval:
+            return False
+
         with self.action_queue_lock:
+            if self.action_chunk_size <= 0:
+                # Bootstrap phase: allow first observations before first action chunk arrives.
+                return True
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
     def _get_observation_timestep(self) -> int:
@@ -537,7 +546,9 @@ class RobotClient:
                 observation.must_go = self.must_go.is_set() and self.action_queue.empty()
                 current_queue_size = self.action_queue.qsize()
 
-            _ = self.send_observation(observation)
+            sent_ok = self.send_observation(observation)
+            if sent_ok:
+                self._last_obs_send_perf = time.perf_counter()
 
             if not self._transport_mode_logged:
                 raw_total = int(transport_stats.get("raw_total_bytes", 0))
