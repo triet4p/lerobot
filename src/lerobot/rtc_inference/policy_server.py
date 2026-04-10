@@ -29,8 +29,10 @@ import math
 import pickle  # nosec
 import threading
 import time
+from csv import writer
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -61,6 +63,37 @@ from .helpers import (
     observations_similar,
     raw_observation_to_observation,
 )
+
+
+class _OrderedCsvAuditWriter:
+    """Append-only ordered CSV writer using a background thread."""
+
+    def __init__(self, file_path: Path, header: list[str]):
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = file_path.open("w", encoding="utf-8", newline="")
+        self._writer = writer(self._file)
+        self._writer.writerow(header)
+        self._file.flush()
+
+        self._queue: Queue[list[Any] | None] = Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            row = self._queue.get()
+            if row is None:
+                break
+            self._writer.writerow(row)
+            self._file.flush()
+
+    def write_row(self, row: list[Any]) -> None:
+        self._queue.put(row)
+
+    def close(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=2.0)
+        self._file.close()
 
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
@@ -99,6 +132,41 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.rtc_last_queue_update_time: float | None = None
         self._rtc_action_index_before_inference = 0
 
+        # Observation audits (written to dedicated files to keep console logs clean)
+        self._obs_audit_lock = threading.Lock()
+        self._obs_receive_seq = 0
+        self._last_obs_receive_perf: float | None = None
+
+        audit_ts = int(time.time())
+        self._audit_interarrival = _OrderedCsvAuditWriter(
+            Path("logs") / f"policy_server_obs_interarrival_{audit_ts}.csv",
+            [
+                "seq",
+                "server_recv_wall_s",
+                "server_recv_perf_s",
+                "obs_timestep",
+                "client_obs_timestamp_s",
+                "inter_arrival_ms",
+                "one_way_latency_ms",
+                "deserialize_ms",
+                "enqueued",
+                "queue_size_after_enqueue",
+            ],
+        )
+        self._audit_queue_latency = _OrderedCsvAuditWriter(
+            Path("logs") / f"policy_server_queue_latency_{audit_ts}.csv",
+            [
+                "server_dequeue_wall_s",
+                "server_dequeue_perf_s",
+                "obs_timestep",
+                "client_obs_timestamp_s",
+                "recv_to_dequeue_ms",
+                "enqueue_to_dequeue_ms",
+                "queue_size_after_get",
+                "must_go",
+            ],
+        )
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -120,6 +188,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.rtc_latency_tracker = None
         self.rtc_last_queue_update_time = None
         self._rtc_action_index_before_inference = 0
+
+        with self._obs_audit_lock:
+            self._last_obs_receive_perf = None
+            self._obs_receive_seq = 0
+
+    @staticmethod
+    def _delta_ms(end_perf: float, start_perf: float | None) -> float:
+        if start_perf is None:
+            return float("nan")
+        return (end_perf - start_perf) * 1000.0
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -245,6 +323,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.debug(f"Receiving observations from {client_id}")
 
         receive_time = time.time()  # comparing timestamps so need time.time()
+        receive_perf = time.perf_counter()
         start_deserialize = time.perf_counter()
         received_bytes = receive_bytes_in_chunks(
             request_iterator, None, self.shutdown_event, self.logger
@@ -273,10 +352,34 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Deserialization time: {deserialize_time:.6f}s"
         )
 
-        if not self._enqueue_observation(
+        with self._obs_audit_lock:
+            self._obs_receive_seq += 1
+            seq = self._obs_receive_seq
+            inter_arrival_ms = self._delta_ms(receive_perf, self._last_obs_receive_perf)
+            self._last_obs_receive_perf = receive_perf
+
+        setattr(timed_observation, "_server_recv_perf", receive_perf)
+
+        enqueued = self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
-        ):
+        )
+        if not enqueued:
             self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
+
+        self._audit_interarrival.write_row(
+            [
+                seq,
+                f"{receive_time:.6f}",
+                f"{receive_perf:.9f}",
+                obs_timestep,
+                f"{obs_timestamp:.6f}",
+                f"{inter_arrival_ms:.3f}",
+                f"{(receive_time - obs_timestamp) * 1000.0:.3f}",
+                f"{deserialize_time * 1000.0:.3f}",
+                int(enqueued),
+                self.observation_queue.qsize(),
+            ]
+        )
 
         return services_pb2.Empty()
 
@@ -284,12 +387,28 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """Returns actions to the robot client. Actions are sent as a single
         chunk, containing multiple actions."""
         client_id = context.peer()
-        self.logger.info(f"Client {client_id} connected for action streaming")
+        self.logger.debug(f"Client {client_id} connected for action streaming")
 
         # Generate action based on the most recent observation and its timestep
         try:
             getactions_starts = time.perf_counter()
             obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
+            dequeue_wall = time.time()
+            dequeue_perf = time.perf_counter()
+            recv_perf = getattr(obs, "_server_recv_perf", None)
+            enqueue_perf = getattr(obs, "_server_enqueue_perf", None)
+            self._audit_queue_latency.write_row(
+                [
+                    f"{dequeue_wall:.6f}",
+                    f"{dequeue_perf:.9f}",
+                    obs.get_timestep(),
+                    f"{obs.get_timestamp():.6f}",
+                    f"{self._delta_ms(dequeue_perf, recv_perf):.3f}",
+                    f"{self._delta_ms(dequeue_perf, enqueue_perf):.3f}",
+                    self.observation_queue.qsize(),
+                    int(obs.must_go),
+                ]
+            )
             self.logger.info(
                 f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
             )
@@ -320,10 +439,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"[SERVER→CLIENT] Sending {len(action_chunk)} actions | "
                 f"First action: {first_action} | Payload size: {len(actions_bytes)} bytes"
             )
-            print(
-                f"[SERVER→CLIENT] Sending {len(action_chunk)} actions | "
-                f"First action: {first_action} | Payload size: {len(actions_bytes)} bytes"
-            )
 
             self.logger.info(
                 f"Action chunk #{obs.get_timestep()} generated | "
@@ -344,13 +459,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return actions
 
         except Empty:  # no observation added to queue in obs_queue_timeout
-            self.logger.warning("[SERVER] GetActions called but observation queue EMPTY — returning Empty")
-            print("[SERVER] GetActions called but observation queue EMPTY — returning Empty")
+            self.logger.debug("[SERVER] GetActions called but observation queue empty; returning Empty")
             return services_pb2.Empty()
 
         except Exception as e:
-            print(f"[SERVER] Error in GetActions: {e}")
-            self.logger.error(f"Error in StreamActions: {e}")
+            self.logger.exception(f"Error in StreamActions: {e}")
 
             return services_pb2.Empty()
 
@@ -398,6 +511,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 self.logger.debug("Observation queue was full, removed oldest observation")
 
             # Now put the new observation (never blocks as queue is non-full here)
+            setattr(obs, "_server_enqueue_perf", time.perf_counter())
             self.observation_queue.put(obs)
             return True
 
@@ -574,6 +688,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def stop(self):
         """Stop the server"""
         self._reset_server()
+        self._audit_interarrival.close()
+        self._audit_queue_latency.close()
         self.logger.info("Server stopping...")
 
 
@@ -596,10 +712,11 @@ def serve(cfg: PolicyServerConfig):
 
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
-
-    server.wait_for_termination()
-
-    policy_server.logger.info("Server terminated")
+    try:
+        server.wait_for_termination()
+    finally:
+        policy_server.stop()
+        policy_server.logger.info("Server terminated")
 
 
 if __name__ == "__main__":
