@@ -122,6 +122,17 @@ class RobotClientConfig:
     # Task instruction for the robot to execute (e.g., 'fold my tshirt')
     task: str = field(default="", metadata={"help": "Task instruction for the robot to execute"})
 
+    # Optional observation key remapping (e.g. camera1 -> image)
+    rename_map: dict[str, str] = field(
+        default_factory=lambda: {
+            "observation.images.camera1": "observation.images.image",
+            "observation.images.camera2": "observation.images.image2",
+            "observation.images.camera3": "observation.images.image3",
+            "observation.images.camera4": "observation.images.image4",
+        },
+        metadata={"help": "Optional mapping to align robot observation keys with model input_features"},
+    )
+
     # RTC configuration (used by rtc_inference.policy_server)
     rtc_enabled: bool = field(default=True, metadata={"help": "Enable RTC on server-side policy"})
     rtc_execution_horizon: int = field(
@@ -224,6 +235,9 @@ class RobotClientConfig:
         if self.inference_delay_steps is not None and self.inference_delay_steps < 0:
             raise ValueError(f"inference_delay_steps must be >= 0, got {self.inference_delay_steps}")
 
+        if not isinstance(self.rename_map, dict):
+            raise ValueError("rename_map must be a dictionary")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -243,6 +257,7 @@ class RobotClientConfig:
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
+            "rename_map": self.rename_map,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
             "rtc_enabled": self.rtc_enabled,

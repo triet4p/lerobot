@@ -106,6 +106,7 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            rename_map=config.rename_map,
             rtc_enabled=config.rtc_enabled,
             rtc_execution_horizon=config.rtc_execution_horizon,
             rtc_max_guidance_weight=config.rtc_max_guidance_weight,

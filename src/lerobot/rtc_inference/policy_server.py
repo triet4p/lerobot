@@ -85,6 +85,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.device = None
         self.policy_type = None
         self.lerobot_features = None
+        self.rename_map: dict[str, str] = {}
         self.actions_per_chunk = None
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
@@ -159,6 +160,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.device = policy_specs.device
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
+        self.rename_map = dict(getattr(policy_specs, "rename_map", {}) or {})
         self.actions_per_chunk = policy_specs.actions_per_chunk
         self.rtc_enabled = bool(getattr(policy_specs, "rtc_enabled", False))
         self.rtc_inference_delay_steps = getattr(policy_specs, "inference_delay_steps", None)
@@ -203,7 +205,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             pretrained_path=policy_specs.pretrained_name_or_path,
             preprocessor_overrides={
                 "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                "rename_observations_processor": {"rename_map": self.rename_map},
             },
             postprocessor_overrides={"device_processor": device_override},
         )
@@ -458,6 +460,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
+            rename_map=self.rename_map,
         )
         prepare_time = time.perf_counter() - start_prepare
 
