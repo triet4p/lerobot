@@ -59,6 +59,7 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    decode_observation_images_from_transport,
     get_logger,
     observations_similar,
     raw_observation_to_observation,
@@ -66,26 +67,56 @@ from .helpers import (
 
 
 class _OrderedCsvAuditWriter:
-    """Append-only ordered CSV writer using a background thread."""
+    """Append-only ordered CSV writer using a background thread.
 
-    def __init__(self, file_path: Path, header: list[str]):
+    Rows are buffered and flushed in batches to reduce I/O noise.
+    """
+
+    def __init__(
+        self,
+        file_path: Path,
+        header: list[str],
+        batch_size: int = 25,
+        flush_interval_s: float = 1.0,
+    ):
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file_path = file_path
         self._file = file_path.open("w", encoding="utf-8", newline="")
         self._writer = writer(self._file)
         self._writer.writerow(header)
         self._file.flush()
 
+        self._batch_size = max(1, batch_size)
+        self._flush_interval_s = max(0.1, flush_interval_s)
         self._queue: Queue[list[Any] | None] = Queue()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def _flush_rows(self, rows: list[list[Any]]) -> None:
+        if not rows:
+            return
+        self._writer.writerows(rows)
+        self._file.flush()
+
     def _run(self) -> None:
+        pending_rows: list[list[Any]] = []
         while True:
-            row = self._queue.get()
+            try:
+                row = self._queue.get(timeout=self._flush_interval_s)
+            except Empty:
+                self._flush_rows(pending_rows)
+                pending_rows = []
+                continue
+
             if row is None:
                 break
-            self._writer.writerow(row)
-            self._file.flush()
+
+            pending_rows.append(row)
+            if len(pending_rows) >= self._batch_size:
+                self._flush_rows(pending_rows)
+                pending_rows = []
+
+        self._flush_rows(pending_rows)
 
     def write_row(self, row: list[Any]) -> None:
         self._queue.put(row)
@@ -119,6 +150,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = None
         self.lerobot_features = None
         self.rename_map: dict[str, str] = {}
+        self.image_compress_enable = False
+        self.image_compress_quality = 90
         self.actions_per_chunk = None
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
@@ -138,8 +171,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._last_obs_receive_perf: float | None = None
 
         audit_ts = int(time.time())
+        audit_dir = Path("logs") / "rtc_audit"
         self._audit_interarrival = _OrderedCsvAuditWriter(
-            Path("logs") / f"policy_server_obs_interarrival_{audit_ts}.csv",
+            audit_dir / f"policy_server_obs_interarrival_{audit_ts}.csv",
             [
                 "seq",
                 "server_recv_wall_s",
@@ -149,12 +183,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 "inter_arrival_ms",
                 "one_way_latency_ms",
                 "deserialize_ms",
+                "transport_mode",
+                "expected_transport_mode",
+                "payload_bytes",
+                "compression_ratio",
+                "decode_ms",
+                "decoded_shape_cam1",
+                "decoded_shape_cam2",
+                "decode_error",
                 "enqueued",
                 "queue_size_after_enqueue",
             ],
         )
         self._audit_queue_latency = _OrderedCsvAuditWriter(
-            Path("logs") / f"policy_server_queue_latency_{audit_ts}.csv",
+            audit_dir / f"policy_server_queue_latency_{audit_ts}.csv",
             [
                 "server_dequeue_wall_s",
                 "server_dequeue_perf_s",
@@ -165,6 +207,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 "queue_size_after_get",
                 "must_go",
             ],
+        )
+        self.logger.info(
+            "RTC audit files | inter_arrival=%s | queue_latency=%s",
+            self._audit_interarrival.file_path.as_posix(),
+            self._audit_queue_latency.file_path.as_posix(),
         )
 
     @property
@@ -198,6 +245,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if start_perf is None:
             return float("nan")
         return (end_perf - start_perf) * 1000.0
+
+    @staticmethod
+    def _shape_for_camera(decoded_shapes: dict[str, str], camera_name: str) -> str:
+        for key, shape in decoded_shapes.items():
+            if key.endswith(f".{camera_name}") or camera_name in key:
+                return shape
+        return ""
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -242,6 +296,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.actions_per_chunk = policy_specs.actions_per_chunk
         self.rtc_enabled = bool(getattr(policy_specs, "rtc_enabled", False))
         self.rtc_inference_delay_steps = getattr(policy_specs, "inference_delay_steps", None)
+        self.image_compress_enable = bool(getattr(policy_specs, "image_compress_enable", False))
+        self.image_compress_quality = int(getattr(policy_specs, "image_compress_quality", 90))
 
         policy_class = get_policy_class(self.policy_type)
 
@@ -314,6 +370,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 policy_specs.rtc_prefix_attention_schedule,
                 "auto" if self.rtc_inference_delay_steps is None else self.rtc_inference_delay_steps,
             )
+        self.logger.info(
+            "Transport session settings (from client policy setup) | mode=%s | jpeg_quality=%s",
+            "jpeg" if self.image_compress_enable else "raw",
+            self.image_compress_quality,
+        )
 
         return services_pb2.Empty()
 
@@ -330,6 +391,68 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )  # blocking call while looping over request_iterator
         timed_observation = pickle.loads(received_bytes)  # nosec
         deserialize_time = time.perf_counter() - start_deserialize
+
+        expected_transport_mode = "jpeg" if self.image_compress_enable else "raw"
+        decode_error = ""
+        try:
+            decoded_observation, decode_stats = decode_observation_images_from_transport(
+                timed_observation.get_observation()
+            )
+            timed_observation.observation = decoded_observation
+        except Exception as exc:
+            decode_stats = {
+                "mode": "decode-error",
+                "decode_ms": 0.0,
+                "raw_total_bytes": 0,
+                "encoded_total_bytes": 0,
+                "decoded_shapes": {},
+            }
+            decode_error = str(exc)
+
+            self.logger.error(
+                "Dropping observation due to decode failure | timestep=%s | expected_mode=%s | error=%s",
+                timed_observation.get_timestep(),
+                expected_transport_mode,
+                decode_error,
+            )
+
+            with self._obs_audit_lock:
+                self._obs_receive_seq += 1
+                seq = self._obs_receive_seq
+                inter_arrival_ms = self._delta_ms(receive_perf, self._last_obs_receive_perf)
+                self._last_obs_receive_perf = receive_perf
+
+            self._audit_interarrival.write_row(
+                [
+                    seq,
+                    f"{receive_time:.6f}",
+                    f"{receive_perf:.9f}",
+                    timed_observation.get_timestep(),
+                    f"{timed_observation.get_timestamp():.6f}",
+                    f"{inter_arrival_ms:.3f}",
+                    f"{(receive_time - timed_observation.get_timestamp()) * 1000.0:.3f}",
+                    f"{deserialize_time * 1000.0:.3f}",
+                    "decode-error",
+                    expected_transport_mode,
+                    len(received_bytes),
+                    "nan",
+                    "0.000",
+                    "",
+                    "",
+                    decode_error,
+                    0,
+                    self.observation_queue.qsize(),
+                ]
+            )
+
+            return services_pb2.Empty()
+
+        if expected_transport_mode != decode_stats.get("mode", "raw"):
+            self.logger.warning(
+                "Transport mode mismatch | expected=%s | effective=%s",
+                expected_transport_mode,
+                decode_stats.get("mode", "raw"),
+            )
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
 
@@ -366,6 +489,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if not enqueued:
             self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
 
+        raw_total_bytes = int(decode_stats.get("raw_total_bytes", 0))
+        payload_bytes = len(received_bytes)
+        compression_ratio = (payload_bytes / raw_total_bytes) if raw_total_bytes > 0 else float("nan")
+        decoded_shapes = decode_stats.get("decoded_shapes", {})
+
         self._audit_interarrival.write_row(
             [
                 seq,
@@ -376,6 +504,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"{inter_arrival_ms:.3f}",
                 f"{(receive_time - obs_timestamp) * 1000.0:.3f}",
                 f"{deserialize_time * 1000.0:.3f}",
+                decode_stats.get("mode", "raw"),
+                expected_transport_mode,
+                payload_bytes,
+                f"{compression_ratio:.6f}",
+                f"{float(decode_stats.get('decode_ms', 0.0)):.3f}",
+                self._shape_for_camera(decoded_shapes, "camera1"),
+                self._shape_for_camera(decoded_shapes, "camera2"),
+                decode_error,
                 int(enqueued),
                 self.observation_queue.qsize(),
             ]
@@ -714,6 +850,9 @@ def serve(cfg: PolicyServerConfig):
     server.start()
     try:
         server.wait_for_termination()
+    except KeyboardInterrupt:
+        policy_server.logger.info("KeyboardInterrupt received, stopping server...")
+        server.stop(grace=1.0)
     finally:
         policy_server.stop()
         policy_server.logger.info("Server terminated")

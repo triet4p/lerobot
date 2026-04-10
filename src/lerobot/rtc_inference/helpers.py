@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from lerobot.configs.types import PolicyFeature, RTCAttentionSchedule
@@ -49,6 +50,10 @@ LeRobotObservation = dict[str, torch.Tensor]
 
 # observation, ready for policy inference (image keys resized)
 Observation = dict[str, torch.Tensor]
+
+TRANSPORT_META_KEY = "__lerobot_transport_meta__"
+JPEG_ENCODING_TAG = "jpeg"
+JPEG_ENCODED_FRAME_KEY = "__lerobot_jpeg_frame__"
 
 
 def visualize_action_queue_size(action_queue_size: list[int]) -> None:
@@ -117,6 +122,170 @@ def prepare_image(image: torch.Tensor) -> torch.Tensor:
     image = image.contiguous()
 
     return image
+
+
+def _is_transport_image_key(key: str, value: Any) -> bool:
+    if not key.startswith(OBS_IMAGES):
+        return False
+    if isinstance(value, torch.Tensor):
+        return value.ndim == 3
+    if isinstance(value, np.ndarray):
+        return value.ndim == 3
+    return False
+
+
+def _to_uint8_hwc(image: Any) -> np.ndarray:
+    if isinstance(image, torch.Tensor):
+        image_np = image.detach().cpu().numpy()
+    elif isinstance(image, np.ndarray):
+        image_np = image
+    else:
+        raise TypeError(f"Unsupported image type for transport compression: {type(image)}")
+
+    if image_np.ndim != 3:
+        raise ValueError(f"Expected HWC image with ndim=3, got shape={image_np.shape}")
+
+    if image_np.dtype != np.uint8:
+        image_np = np.clip(image_np, 0, 255).astype(np.uint8)
+
+    return np.ascontiguousarray(image_np)
+
+
+def encode_observation_images_for_transport(
+    raw_observation: RawObservation,
+    enabled: bool,
+    quality: int,
+) -> tuple[RawObservation, dict[str, Any]]:
+    """Encode image observations to JPEG for transport only (no resize)."""
+    stats: dict[str, Any] = {
+        "mode": "raw",
+        "quality": quality,
+        "encoded_image_count": 0,
+        "raw_total_bytes": 0,
+        "encoded_total_bytes": 0,
+    }
+    if not enabled:
+        return raw_observation, stats
+
+    try:
+        import cv2
+    except Exception as exc:
+        raise RuntimeError("JPEG transport is enabled but OpenCV is not available") from exc
+
+    encoded_observation: RawObservation = {}
+    for key, value in raw_observation.items():
+        if not _is_transport_image_key(key, value):
+            encoded_observation[key] = value
+            continue
+
+        image = _to_uint8_hwc(value)
+        h, w, c = image.shape
+        ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if not ok:
+            raise RuntimeError(f"Failed to JPEG-encode image key '{key}'")
+
+        encoded_bytes = encoded.tobytes()
+        stats["encoded_image_count"] += 1
+        stats["raw_total_bytes"] += int(image.nbytes)
+        stats["encoded_total_bytes"] += len(encoded_bytes)
+
+        encoded_observation[key] = {
+            JPEG_ENCODED_FRAME_KEY: True,
+            "encoding": JPEG_ENCODING_TAG,
+            "data": encoded_bytes,
+            "orig_h": int(h),
+            "orig_w": int(w),
+            "orig_c": int(c),
+            "orig_dtype": str(image.dtype),
+        }
+
+    if stats["encoded_image_count"] > 0:
+        stats["mode"] = JPEG_ENCODING_TAG
+        encoded_observation[TRANSPORT_META_KEY] = {
+            "mode": JPEG_ENCODING_TAG,
+            "quality": int(quality),
+            "raw_total_bytes": int(stats["raw_total_bytes"]),
+            "encoded_total_bytes": int(stats["encoded_total_bytes"]),
+        }
+
+    return encoded_observation, stats
+
+
+def decode_observation_images_from_transport(
+    raw_observation: RawObservation,
+) -> tuple[RawObservation, dict[str, Any]]:
+    """Decode transport-compressed image observations and validate shape round-trip."""
+    decode_start = time.perf_counter()
+    decoded_observation: RawObservation = {}
+    decoded_shapes: dict[str, str] = {}
+    decoded_image_count = 0
+    encoded_total_bytes = 0
+    raw_total_bytes = 0
+    cv2 = None
+
+    for key, value in raw_observation.items():
+        if key == TRANSPORT_META_KEY:
+            continue
+
+        if not isinstance(value, dict) or not value.get(JPEG_ENCODED_FRAME_KEY, False):
+            decoded_observation[key] = value
+            continue
+
+        if value.get("encoding") != JPEG_ENCODING_TAG:
+            raise ValueError(f"Unsupported transport encoding '{value.get('encoding')}' for key '{key}'")
+
+        encoded_blob = value.get("data", b"")
+        if not isinstance(encoded_blob, (bytes, bytearray)):
+            raise ValueError(f"Invalid JPEG payload for key '{key}'")
+
+        encoded_total_bytes += len(encoded_blob)
+        if cv2 is None:
+            try:
+                import cv2 as _cv2
+            except Exception as exc:
+                raise RuntimeError(
+                    "Cannot decode JPEG transport payload because OpenCV is unavailable"
+                ) from exc
+            cv2 = _cv2
+        arr = np.frombuffer(encoded_blob, dtype=np.uint8)
+        decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if decoded is None:
+            raise ValueError(f"Failed to decode JPEG payload for key '{key}'")
+
+        expected_h = int(value.get("orig_h"))
+        expected_w = int(value.get("orig_w"))
+        expected_c = int(value.get("orig_c", 3))
+        decoded_h, decoded_w, decoded_c = decoded.shape
+
+        if (decoded_h, decoded_w, decoded_c) != (expected_h, expected_w, expected_c):
+            raise ValueError(
+                "Decoded image shape mismatch for key "
+                f"'{key}': got {(decoded_h, decoded_w, decoded_c)} "
+                f"expected {(expected_h, expected_w, expected_c)}"
+            )
+
+        decoded_observation[key] = decoded
+        decoded_shapes[key] = f"{decoded_w}x{decoded_h}"
+        decoded_image_count += 1
+        raw_total_bytes += int(decoded.nbytes)
+
+    decode_ms = (time.perf_counter() - decode_start) * 1000.0
+
+    if decoded_image_count > 0:
+        mode = JPEG_ENCODING_TAG
+    else:
+        mode = "raw"
+
+    stats = {
+        "mode": mode,
+        "decoded_image_count": decoded_image_count,
+        "decode_ms": decode_ms,
+        "raw_total_bytes": raw_total_bytes,
+        "encoded_total_bytes": encoded_total_bytes,
+        "decoded_shapes": decoded_shapes,
+    }
+
+    return decoded_observation, stats
 
 
 def extract_state_from_raw_observation(
@@ -290,6 +459,8 @@ class RemotePolicyConfig:
     rtc_debug_maxlen: int = 100
     inference_delay_steps: int | None = None
     xvla_domain_id: int | None = None
+    image_compress_enable: bool = False
+    image_compress_quality: int = 90
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:
