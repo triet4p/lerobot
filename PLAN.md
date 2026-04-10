@@ -6,7 +6,7 @@ Ràng buộc bắt buộc:
 - Chỉ nén khi truyền.
 - Không thay đổi kích thước ảnh trong pipeline nén/giải nén.
 - Ảnh sau giải nén ở server phải đúng kích thước gốc trước khi đưa vào model.
-- Với cấu hình hiện tại: cam1 phải là 1920x1080, cam2 phải là 640x360.
+- Kích thước sau giải nén phải khớp đúng kích thước cấu hình camera của phiên chạy hiện tại.
 
 Lưu ý thiết kế cũ: observation timestep từng được bám theo action index để giảm tần suất infer dư thừa và đồng bộ gần với nhịp action rollout. Cách này giúp tránh flood ở điều kiện mạng tốt, nhưng trong bối cảnh có interpolation/VPN và polling GetActions theo cụm thì dễ gây trùng timestep hoặc thưa observation enqueue, dẫn tới khựng. Vì vậy chuyển sang timestep observation monotonic độc lập là thay đổi bắt buộc để ổn định cadence.
 
@@ -45,9 +45,7 @@ Lưu ý thiết kế cũ: observation timestep từng được bám theo action 
 - Lúc capture ở client
 - Sau decode ở server
 - Trước khi đưa vào model
-3. Với cấu hình hiện tại phải đạt:
-- cam1: 1920x1080
-- cam2: 640x360
+3. Với mỗi camera, kích thước ở 3 điểm (capture client, decode server, trước model) phải trùng với kích thước đã cấu hình cho camera đó trong command/robot config của phiên chạy.
 4. So sánh trước/sau theo CSV:
 - inter_arrival_ms: p50/p95/max
 - recv_to_dequeue_ms: p50/p95
