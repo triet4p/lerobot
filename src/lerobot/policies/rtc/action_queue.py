@@ -245,10 +245,7 @@ class ActionQueue:
 
             if indexes_diff != expected_indexes_diff:
                 logger.warning(
-                    (
-                        "Indexes diff is not equal to expected delay. "
-                        "indexes_diff=%d, expected=%d, real_delay=%d"
-                    ),
+                    ("Indexes diff is not equal to real delay. indexes_diff=%d, expected=%d, real_delay=%d"),
                     indexes_diff,
                     expected_indexes_diff,
                     real_delay,

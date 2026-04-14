@@ -267,7 +267,9 @@ class XVLAModel(nn.Module):
 
         steps = max(1, int(steps))
         if not self._rtc_enabled() or self.rtc_processor is None:
-            x1 = torch.randn(batch_size, self.chunk_size, action_dim, device=proprio.device, dtype=target_dtype)
+            x1 = torch.randn(
+                batch_size, self.chunk_size, action_dim, device=proprio.device, dtype=target_dtype
+            )
             action = torch.zeros_like(x1)
 
             for i in range(steps, 0, -1):

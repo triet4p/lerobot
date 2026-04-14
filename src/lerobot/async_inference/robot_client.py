@@ -384,33 +384,31 @@ class RobotClient:
         # --- CÁCH LẤY VỊ TRÍ THỰC TẾ (STATE) ĐỂ DEBUG ---
         # 1. Gọi hàm get_observation theo đúng class Robot
         current_obs = self.robot.get_observation()
-        
+
         # 2. LeRobot lưu vị trí các khớp trong key 'observation.state' (kiểu tensor/array)
         # Chúng ta cần map lại vì action_dict dùng tên khớp, còn observation.state thường là mảng số
         current_positions = current_obs.get("observation.state", None)
-        
+
         if current_positions is not None:
             # Chuyển đổi tensor/numpy sang list để dễ nhìn
             if hasattr(current_positions, "tolist"):
                 curr_list = current_positions.tolist()
             else:
                 curr_list = list(current_positions)
-            
+
             # Lấy list các giá trị action AI yêu cầu theo đúng thứ tự khớp
             target_list = [action_dict[k] for k in self.robot.action_features]
 
             # Tính Delta (Action so với Current Pose)
-            deltas = [t - c for t, c in zip(target_list, curr_list)]
-            
+            deltas = [t - c for t, c in zip(target_list, curr_list, strict=False)]
+
             self.logger.info(f"[DEBUG] Timestep #{timed_action.get_timestep()}")
             self.logger.info(f"AI Target (Rel to Zero): {target_list}")
             self.logger.info(f"Actual Pos (Rel to Zero): {curr_list}")
             self.logger.info(f"Delta (Robot needs to move): {deltas}")
         # -----------------------------------------------
 
-        _performed_action = self.robot.send_action(
-            action_dict
-        )
+        _performed_action = self.robot.send_action(action_dict)
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
 
@@ -442,14 +440,16 @@ class RobotClient:
 
             raw_observation: RawObservation = self.robot.get_observation()
             raw_observation["task"] = task
-            
-            import cv2
+
             import os
+
+            import cv2
             import numpy as np
+
             os.makedirs("debug_frames", exist_ok=True)
             for key, value in raw_observation.items():
                 if "image" in key or "camera" in key:
-                    if hasattr(value, 'numpy'):
+                    if hasattr(value, "numpy"):
                         frame = value.numpy()
                     elif isinstance(value, np.ndarray):
                         frame = value

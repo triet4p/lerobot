@@ -239,12 +239,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             # Create and return the action chunk
             actions = services_pb2.Actions(data=actions_bytes)
 
-            self.logger.info(f"[SERVER→CLIENT] Sending {len(action_chunk)} actions | "
-                        f"First action: {action_chunk[0].action.tolist()} | "
-                        f"Payload size: {len(actions_bytes)} bytes")
-            print(f"[SERVER→CLIENT] Sending {len(action_chunk)} actions | "
-                  f"First action: {action_chunk[0].action.tolist()} | "
-                  f"Payload size: {len(actions_bytes)} bytes")
+            self.logger.info(
+                f"[SERVER->CLIENT] Sending {len(action_chunk)} actions | "
+                f"First action: {action_chunk[0].action.tolist()} | "
+                f"Payload size: {len(actions_bytes)} bytes"
+            )
+            print(
+                f"[SERVER->CLIENT] Sending {len(action_chunk)} actions | "
+                f"First action: {action_chunk[0].action.tolist()} | "
+                f"Payload size: {len(actions_bytes)} bytes"
+            )
 
             self.logger.info(
                 f"Action chunk #{obs.get_timestep()} generated | "
@@ -265,8 +269,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return actions
 
         except Empty:  # no observation added to queue in obs_queue_timeout
-            self.logger.warning("[SERVER] GetActions called but observation queue EMPTY — returning Empty")
-            print("[SERVER] GetActions called but observation queue EMPTY — returning Empty")
+            self.logger.warning("[SERVER] GetActions called but observation queue EMPTY - returning Empty")
+            print("[SERVER] GetActions called but observation queue EMPTY - returning Empty")
             return services_pb2.Empty()
 
         except Exception as e:
