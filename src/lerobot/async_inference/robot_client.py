@@ -378,28 +378,28 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
-        # Đây là Pose mà AI muốn (Target)
+        # This is the target pose requested by the policy.
         action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
 
-        # --- CÁCH LẤY VỊ TRÍ THỰC TẾ (STATE) ĐỂ DEBUG ---
-        # 1. Gọi hàm get_observation theo đúng class Robot
+        # --- GET CURRENT ROBOT STATE FOR DEBUGGING ---
+        # 1. Query the robot observation from the robot class.
         current_obs = self.robot.get_observation()
 
-        # 2. LeRobot lưu vị trí các khớp trong key 'observation.state' (kiểu tensor/array)
-        # Chúng ta cần map lại vì action_dict dùng tên khớp, còn observation.state thường là mảng số
+        # 2. Joint positions are stored in 'observation.state' (tensor/array).
+        # Remap values because action_dict uses joint names while observation.state is often an indexed array.
         current_positions = current_obs.get("observation.state", None)
 
         if current_positions is not None:
-            # Chuyển đổi tensor/numpy sang list để dễ nhìn
+            # Convert tensor/numpy to list for readable debug output.
             if hasattr(current_positions, "tolist"):
                 curr_list = current_positions.tolist()
             else:
                 curr_list = list(current_positions)
 
-            # Lấy list các giá trị action AI yêu cầu theo đúng thứ tự khớp
+            # Build target action values in robot joint order.
             target_list = [action_dict[k] for k in self.robot.action_features]
 
-            # Tính Delta (Action so với Current Pose)
+            # Compute delta between target action and current pose.
             deltas = [t - c for t, c in zip(target_list, curr_list, strict=False)]
 
             self.logger.info(f"[DEBUG] Timestep #{timed_action.get_timestep()}")
@@ -455,7 +455,7 @@ class RobotClient:
                         frame = value
                     else:
                         continue
-                    # Chỉ save 1 frame duy nhất để check
+                    # Save only one frame per key for quick verification.
                     save_path = f"debug_frames/{key}.png"
                     if not os.path.exists(save_path):
                         cv2.imwrite(save_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
